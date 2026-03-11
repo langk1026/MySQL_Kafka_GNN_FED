@@ -1,0 +1,80 @@
+<div class="rl-shell">
+  <header class="rl-header">
+    <div>
+      <p class="rl-overline">Fraud Event Detection</p>
+      <h1>Real-Time Inference Monitoring</h1>
+      <p class="rl-subtitle">Transaction model decisions and operational health updated every 10 seconds.</p>
+    </div>
+    <div class="rl-header-meta">
+      <div class="rl-live-group">
+        <span class="rl-live-dot"></span>
+        <span>Live</span>
+      </div>
+      <p id="rlLastUpdated">Last updated: -</p>
+    </div>
+  </header>
+
+  <section class="rl-kpi-grid" id="rlKpiGrid"></section>
+
+  <section class="rl-grid rl-grid-two">
+    <article class="rl-card">
+      <div class="rl-card-head">
+        <h2>Scan vs Flagged Trend</h2>
+        <p>By minute</p>
+      </div>
+      <canvas id="rlTrendCanvas" width="900" height="260"></canvas>
+    </article>
+
+    <article class="rl-card">
+      <div class="rl-card-head">
+        <h2>Score Distribution</h2>
+        <p>Inference score buckets</p>
+      </div>
+      <div id="rlHistogram" class="rl-histogram"></div>
+    </article>
+  </section>
+
+  <section class="rl-grid rl-grid-two">
+    <article class="rl-card">
+      <div class="rl-card-head">
+        <h2>Decision Mix</h2>
+        <p>Allow / Block / Challenge</p>
+      </div>
+      <div id="rlDecisionMix" class="rl-decision-mix"></div>
+    </article>
+
+    <article class="rl-card">
+      <div class="rl-card-head">
+        <h2>Channel Matrix</h2>
+        <p>Channel by action counts</p>
+      </div>
+      <div class="rl-table-wrap">
+        <table id="rlChannelMatrix" class="rl-table"></table>
+      </div>
+    </article>
+  </section>
+
+  <section class="rl-grid rl-grid-two">
+    <article class="rl-card">
+      <div class="rl-card-head">
+        <h2>Top Risky Merchants</h2>
+        <p>Ranked by risk volume and average score</p>
+      </div>
+      <div class="rl-table-wrap">
+        <table id="rlTopMerchants" class="rl-table"></table>
+      </div>
+    </article>
+
+    <article class="rl-card">
+      <div class="rl-card-head">
+        <h2>Recent Flagged Transactions</h2>
+        <p>Latest high-risk events</p>
+      </div>
+      <div class="rl-table-wrap rl-table-wrap-tall">
+        <table id="rlRecentFlagged" class="rl-table"></table>
+      </div>
+    </article>
+  </section>
+
+  <section id="rlStateBanner" class="rl-state-banner rl-hidden"></section>
+</div>

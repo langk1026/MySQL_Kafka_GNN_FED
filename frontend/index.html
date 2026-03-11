@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fraud AI Streaming - Dashboard</title>
+  <link rel="stylesheet" href="/static/fed_rl.css?v=2">
+  <style>
+    .rl-refresh-info {
+      font-size: 11px;
+      color: var(--rl-muted);
+      margin-left: 12px;
+    }
+    .rl-conn-error {
+      background: #fff3f3;
+      border-color: #e0b0b0;
+      color: #8b2020;
+    }
+    .rl-live-dot--active {
+      background: #1a8a1a;
+      box-shadow: 0 0 0 4px rgba(26, 138, 26, 0.18);
+      animation: rl-pulse 2s infinite;
+    }
+    @keyframes rl-pulse {
+      0%, 100% { box-shadow: 0 0 0 4px rgba(26, 138, 26, 0.18); }
+      50% { box-shadow: 0 0 0 8px rgba(26, 138, 26, 0.08); }
+    }
+  </style>
+</head>
+<body>
+  <!-- Refresh Progress Bar Indicator -->
+  <div class="rl-refresh-progress">
+    <div class="rl-refresh-progress-bar" id="rlRefreshProgressBar"></div>
+  </div>
+
+  <div class="rl-shell">
+    <header class="rl-header">
+      <div>
+        <p class="rl-overline">Fraud Event Detection</p>
+        <h1>Real-Time Inference Monitoring</h1>
+        <p class="rl-subtitle">Transaction model decisions and operational health updated every 10 seconds.</p>
+      </div>
+      <div class="rl-header-meta">
+        <div class="rl-live-group">
+          <span class="rl-live-dot" id="rlLiveDot"></span>
+          <span>Live</span>
+        </div>
+        <p id="rlLastUpdated">Last updated: -</p>
+      </div>
+    </header>
+
+    <section class="rl-kpi-grid" id="rlKpiGrid"></section>
+
+    <section class="rl-grid rl-grid-two">
+      <article class="rl-card">
+        <div class="rl-card-head">
+          <h2>Scan vs Flagged Trend</h2>
+          <p>By minute</p>
+        </div>
+        <canvas id="rlTrendCanvas" width="900" height="260"></canvas>
+      </article>
+
+      <article class="rl-card">
+        <div class="rl-card-head">
+          <h2>Score Distribution</h2>
+          <p>Inference score buckets</p>
+        </div>
+        <div id="rlHistogram" class="rl-histogram"></div>
+      </article>
+    </section>
+
+    <section class="rl-grid rl-grid-two">
+      <article class="rl-card">
+        <div class="rl-card-head">
+          <h2>Decision Mix</h2>
+          <p>Allow / Block / Challenge</p>
+        </div>
+        <div id="rlDecisionMix" class="rl-decision-mix"></div>
+      </article>
+
+      <article class="rl-card">
+        <div class="rl-card-head">
+          <h2>Location Matrix</h2>
+          <p>Location by action counts</p>
+        </div>
+        <div class="rl-table-wrap">
+          <table id="rlChannelMatrix" class="rl-table"></table>
+        </div>
+      </article>
+    </section>
+
+    <section class="rl-grid rl-grid-two">
+      <article class="rl-card">
+        <div class="rl-card-head">
+          <h2>Top Risky Merchants</h2>
+          <p>Ranked by risk volume and average score</p>
+        </div>
+        <div class="rl-table-wrap">
+          <table id="rlTopMerchants" class="rl-table"></table>
+        </div>
+      </article>
+
+      <article class="rl-card">
+        <div class="rl-card-head">
+          <h2>Recent Flagged Transactions</h2>
+          <p>Latest high-risk events</p>
+        </div>
+        <div class="rl-table-wrap rl-table-wrap-tall">
+          <table id="rlRecentFlagged" class="rl-table"></table>
+        </div>
+      </article>
+    </section>
+
+    <section id="rlStateBanner" class="rl-state-banner rl-hidden"></section>
+  </div>
+
+  <div id="rlToast" class="rl-toast"><span class="rl-live-dot"></span>Dashboard data refreshed</div>
+
+  <script src="/static/fed_rl.js"></script>
+  <script>
+    const API_BASE = window.location.origin;
+    const REFRESH_MS = 10000;
+
+    async function fetchAndRender() {
+      // Add skeleton loading state
+      const shell = document.querySelector('.rl-shell');
+      if (shell) shell.classList.add('rl-refreshing');
+
+      // Reset and restart the progress bar
+      const pbar = document.getElementById('rlRefreshProgressBar');
+      if (pbar) {
+        pbar.style.transition = 'none';
+        pbar.style.width = '0%';
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            pbar.style.transition = `width ${REFRESH_MS}ms linear`;
+            pbar.style.width = '100%';
+          });
+        });
+      }
+
+      try {
+        const resp = await fetch(`${API_BASE}/dashboard/data`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        
+        window.FED_RL_PREV_PAYLOAD = window.FED_RL_PAYLOAD;
+        window.FED_RL_PAYLOAD = data;
+
+        // Re-run the renderer
+        const script = document.createElement("script");
+        script.src = "/static/fed_rl.js?" + Date.now();
+        document.body.appendChild(script);
+
+        // Update live indicator and toast
+        const dot = document.getElementById("rlLiveDot");
+        if (dot) dot.className = "rl-live-dot rl-live-dot--active";
+
+        const toast = document.getElementById("rlToast");
+        if (toast) {
+          toast.classList.add("show");
+          setTimeout(() => toast.classList.remove("show"), 3000);
+        }
+      } catch (err) {
+        console.error("Dashboard fetch failed:", err);
+        const dot = document.getElementById("rlLiveDot");
+        if (dot) dot.className = "rl-live-dot";
+        const banner = document.getElementById("rlStateBanner");
+        if (banner) {
+          banner.classList.remove("rl-hidden");
+          banner.classList.add("rl-conn-error");
+          banner.textContent = `Connection error: ${err.message}. Retrying...`;
+        }
+      } finally {
+        setTimeout(() => {
+          if (shell) shell.classList.remove('rl-refreshing');
+        }, 500); // Minimum 500ms guaranteed skeleton display
+      }
+    }
+
+    // Initial load + periodic refresh
+    fetchAndRender();
+    setInterval(fetchAndRender, REFRESH_MS);
+  </script>
+</body>
+</html>
