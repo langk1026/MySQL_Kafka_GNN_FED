@@ -31,8 +31,8 @@ class AppConfig(BaseSettings):
     ML_RETRAIN_INTERVAL: int = 100
 
     # -- Routing thresholds --
-    SCORE_THRESHOLD_FRAUD: float = 0.8
-    SCORE_THRESHOLD_REVIEW: float = 0.3
+    SCORE_THRESHOLD_FRAUD: int = 80
+    SCORE_THRESHOLD_REVIEW: int = 30
 
     # -- Retraining --
     RETRAIN_FEEDBACK_THRESHOLD: int = 100

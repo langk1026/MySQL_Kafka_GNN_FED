@@ -10,7 +10,6 @@ from src.db.repository import TransactionRepo, FeedbackRepo, ExperimentRepo
 from src.streaming.topics import ensure_topics, setup_ksqldb
 from src.streaming.producer import SimulatedProducer
 from src.streaming.consumer import FraudConsumer
-from src.detection.rules import HighAmountRule, LocationAnomalyRule, VelocityRule
 from src.detection.ml_model import IsolationForestModel
 from src.detection.pipeline import ScoringPipeline
 from src.fraud_rings.graph_engine import FraudGraph
@@ -58,12 +57,6 @@ def main():
         retrain_interval=config.ML_RETRAIN_INTERVAL,
     )
     graph = FraudGraph(min_users=config.FRAUD_RING_MIN_USERS)
-    rules = [
-        HighAmountRule(),
-        LocationAnomalyRule(),
-        VelocityRule(ksqldb_url=config.KSQLDB_URL),
-    ]
-
     # 4. LLM (optional)
     llm_analyzer = None
     if config.LLM_ENABLED and config.AZURE_OPENAI_ENDPOINT:
@@ -83,11 +76,8 @@ def main():
 
     # 6. Scoring pipeline
     pipeline = ScoringPipeline(
-        rules=rules,
         ml_model=ml_model,
         graph_engine=graph,
-        llm_analyzer=llm_analyzer,
-        ab_router=ab_router,
         fraud_threshold=config.SCORE_THRESHOLD_FRAUD,
         review_threshold=config.SCORE_THRESHOLD_REVIEW,
     )

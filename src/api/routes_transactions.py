@@ -52,11 +52,27 @@ def submit_transaction(req: TransactionRequest):
         # Persist transaction
         tx_repo.insert_transaction(tx)
 
-        # Score through pipeline if available
+        # Score through pipeline if available.
+        # The pipeline now operates on pre-aggregated velocity alert dicts
+        # (from ksqlDB windows). For direct API scoring, we build a synthetic
+        # single-transaction alert with txn_count=1 as a best-effort estimate.
         if pipeline is not None:
-            result = pipeline.score(tx)
-            tx_repo.insert_fraud_result(result)
-            return result.to_dict()
+            import time as _time
+            now_ms = int(_time.time() * 1000)
+            alert_data = {
+                "dimension":     "USER",
+                "dimension_key": tx.user_id,
+                "txn_count":     1,
+                "total_amount":  tx.amount,
+                "window_start":  now_ms - 3_600_000,
+                "window_end":    now_ms,
+            }
+            result = pipeline.score_alert(alert_data)
+            return {
+                **result,
+                "transaction_id": tx.transaction_id,
+                "note": "Single-transaction estimate. Production scoring uses ksqlDB velocity windows.",
+            }
         else:
             return {"transaction_id": tx.transaction_id, "status": "stored", "note": "Pipeline not available"}
     except Exception as exc:

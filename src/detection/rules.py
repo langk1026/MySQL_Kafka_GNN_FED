@@ -1,125 +1,116 @@
 import logging
 from abc import ABC, abstractmethod
 
-import httpx
-
-from src.models.transaction import Transaction
-
 logger = logging.getLogger(__name__)
 
 
 class Rule(ABC):
-    """Base class for fraud-detection rules."""
-
-    def __init__(self, name: str, description: str):
-        self.name = name
-        self.description = description
+    """Base class for velocity-alert fraud-detection rules."""
 
     @abstractmethod
-    def evaluate(self, transaction: Transaction, history: list[Transaction]) -> float:
-        """Return a risk score between 0.0 and 1.0."""
+    def evaluate(self, alert_data: dict) -> dict | None:
+        """Evaluate the alert and return a result dict or None.
+
+        Returns a dict with keys:
+            rule_id, rule_name, severity (0-100), bucket_id, reason
+        or None if the rule did not trigger.
+        """
         ...
 
 
-class HighAmountRule(Rule):
-    """Flag transactions with unusually high amounts.
+class VelocityAlertRule(Rule):
+    """Tiered severity based on txn_count per dimension.
 
-    Graduated scoring:
-      >$10k → 0.9  (very suspicious, near-certain block)
-      >$5k  → 0.6  (elevated, human review)
-      >$2k  → 0.35 (mild, human review)
+    Dimension → thresholds (count, severity), highest match wins:
+        IP       ≥100→95  ≥80→80  ≥60→60
+        USER     ≥60→95   ≥45→80  ≥30→60   (user_id, proxy for identity/email)
+        DEVICE   ≥60→95   ≥45→80  ≥30→60   (device_id, proxy for mobile)
+        MERCHANT ≥300→95  ≥200→80 ≥150→60
     """
 
-    def __init__(self):
-        super().__init__("High Value", "Transaction amount exceeds threshold")
+    THRESHOLDS: dict[str, list[tuple[int, int]]] = {
+        "IP":       [(100, 95), (80, 80), (60, 60)],
+        "USER":     [(60, 95),  (45, 80), (30, 60)],
+        "DEVICE":   [(60, 95),  (45, 80), (30, 60)],
+        "MERCHANT": [(300, 95), (200, 80), (150, 60)],
+    }
 
-    def evaluate(self, transaction: Transaction, history: list[Transaction]) -> float:
-        if transaction.amount > 10000:
-            return 0.9
-        if transaction.amount > 5000:
-            return 0.6
-        if transaction.amount > 2000:
-            return 0.35
-        return 0.0
+    def evaluate(self, alert_data: dict) -> dict | None:
+        dimension = (alert_data.get("dimension") or "").upper()
+        txn_count = int(alert_data.get("txn_count") or 0)
+        thresholds = self.THRESHOLDS.get(dimension)
+        if not thresholds:
+            return None
+        for threshold, severity in thresholds:
+            if txn_count >= threshold:
+                return {
+                    "rule_id":   "velocity_alert",
+                    "rule_name": "VelocityAlertRule",
+                    "severity":  severity,
+                    "bucket_id": f"vel_{dimension.lower()}",
+                    "reason":    f"{dimension} txn_count {txn_count} >= {threshold} (sev {severity})",
+                }
+        return None
 
 
-class LocationAnomalyRule(Rule):
-    """Flag rapid location changes for the same user.
+class HighWindowAmountRule(Rule):
+    """Flag windows with unusually high total transaction amount.
 
-    A single location change is suspicious (0.5 → human review range).
-    Multiple recent location changes are stronger signals (0.7).
+    Thresholds (total_amount, severity):
+        ≥50 000 → 90
+        ≥20 000 → 70
+        ≥10 000 → 50
     """
 
-    def __init__(self):
-        super().__init__("Location Jump", "User location changed rapidly")
+    THRESHOLDS: list[tuple[float, int]] = [
+        (50_000, 90),
+        (20_000, 70),
+        (10_000, 50),
+    ]
 
-    def evaluate(self, transaction: Transaction, history: list[Transaction]) -> float:
-        user_txs = [tx for tx in history if tx.user_id == transaction.user_id]
-        if not user_txs:
-            return 0.0
-
-        last_tx = user_txs[-1]
-        if last_tx.location == transaction.location:
-            return 0.0
-
-        # Count distinct locations in the last 5 transactions
-        recent = user_txs[-5:]
-        recent_locations = {tx.location for tx in recent}
-        recent_locations.add(transaction.location)
-
-        if len(recent_locations) >= 3:
-            # User has been in 3+ locations recently — stronger signal
-            return 0.7
-        # Single location change — moderate suspicion
-        return 0.5
+    def evaluate(self, alert_data: dict) -> dict | None:
+        total = float(alert_data.get("total_amount") or 0)
+        for threshold, severity in self.THRESHOLDS:
+            if total >= threshold:
+                return {
+                    "rule_id":   "high_window_amount",
+                    "rule_name": "HighWindowAmountRule",
+                    "severity":  severity,
+                    "bucket_id": "amt",
+                    "reason":    f"total_amount {total:,.2f} >= {threshold:,.0f} (sev {severity})",
+                }
+        return None
 
 
-class VelocityRule(Rule):
-    """Query ksqlDB for user transaction velocity.
+class BlacklistRule(Rule):
+    """Check dimension_key against an in-memory blacklist.
 
-    With 100 users and ~1-2 txn/sec producer rate, each user averages
-    ~6 txns per 5-minute window.  Thresholds are set higher to only flag
-    genuinely abnormal bursts:
-      8-14 txns  → 0.4  (moderate, human review)
-      15-24 txns → 0.6  (elevated)
-      25+  txns  → 0.85 (extreme, likely fraud)
+    In production this queries a database; for the POC it uses a
+    class-level set that can be populated via BlacklistRule.add().
     """
 
-    def __init__(self, ksqldb_url: str = "http://ksqldb-server:8088"):
-        super().__init__("Velocity", "High transaction velocity detected via ksqlDB")
-        self._ksqldb_url = ksqldb_url.rstrip("/")
+    _BLACKLIST: set[str] = set()
 
-    def evaluate(self, transaction: Transaction, history: list[Transaction]) -> float:
-        # Sanitize user_id to prevent injection
-        safe_user_id = transaction.user_id.replace("'", "''")
-        query = (
-            f"SELECT txn_count FROM user_velocity "
-            f"WHERE user_id = '{safe_user_id}';"
-        )
-        try:
-            response = httpx.post(
-                f"{self._ksqldb_url}/query",
-                json={"ksql": query, "streamsProperties": {}},
-                headers={"Accept": "application/vnd.ksql.v1+json"},
-                timeout=5.0,
-            )
-            response.raise_for_status()
-            rows = response.json()
+    @classmethod
+    def add(cls, value: str) -> None:
+        cls._BLACKLIST.add(value)
 
-            for row in rows:
-                if "row" in row and "columns" in row["row"]:
-                    txn_count = row["row"]["columns"][0]
-                    if txn_count >= 25:
-                        return 0.85
-                    if txn_count >= 15:
-                        return 0.6
-                    if txn_count >= 8:
-                        return 0.4
-            return 0.0
-        except Exception:
-            logger.debug(
-                "VelocityRule: ksqlDB query failed for user %s, returning 0.0",
-                transaction.user_id,
-                exc_info=True,
-            )
-            return 0.0
+    @classmethod
+    def remove(cls, value: str) -> None:
+        cls._BLACKLIST.discard(value)
+
+    @classmethod
+    def clear(cls) -> None:
+        cls._BLACKLIST.clear()
+
+    def evaluate(self, alert_data: dict) -> dict | None:
+        key = alert_data.get("dimension_key") or ""
+        if key in self._BLACKLIST:
+            return {
+                "rule_id":   "blacklist",
+                "rule_name": "BlacklistRule",
+                "severity":  100,
+                "bucket_id": "bl",
+                "reason":    f"dimension_key {key!r} is blacklisted",
+            }
+        return None

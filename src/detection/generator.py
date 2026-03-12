@@ -5,96 +5,144 @@ from datetime import datetime, timezone
 from src.models.transaction import Transaction
 
 
-class TransactionGenerator:
-    """Generates simulated transactions for testing and development.
+# ---------------------------------------------------------------------------
+# Fixed fraud dimension keys — reused across transactions so that ksqlDB
+# velocity windows accumulate above alert thresholds within one hour.
+#
+# Trigger times at default SimulatedProducer rate (~1 txn/sec, 100 users):
+#   ~10% fraud → ~360 fraud txns/hour per entity
+#   USER / DEVICE  thresholds (≥30)  → fires within ~3 min
+#   IP             threshold  (≥60)  → fires within ~6 min
+#   MERCHANT       threshold  (≥150) → fires within ~15 min
+# ---------------------------------------------------------------------------
+FRAUD_IP       = "10.99.0.99"
+FRAUD_USER     = "User_FRAUD"
+FRAUD_DEVICE   = "Dev_FRAUD"
+FRAUD_MERCHANT = "Merch_FRAUD"
 
-    Each user has a stable home location, primary device, and IP range.
-    Most transactions are normal; a small fraction exhibit anomalous behaviour
-    (location jumps, device changes, high amounts) to produce a realistic
-    mix of Approved / Challenge / Block decisions.
+
+class TransactionGenerator:
+    """Generates simulated transactions for ksqlDB velocity testing.
+
+    Normal users (90%): random but unique IP/device/merchant per user.
+    Fraud transactions (10%): reuse fixed FRAUD_* keys across all four
+    dimensions simultaneously so every velocity window gets hit.
+
+    A/B split within the fraud 10%:
+        5%  → full fraud entity set  (FRAUD_IP + FRAUD_USER + FRAUD_DEVICE + FRAUD_MERCHANT)
+        5%  → suspicious-user ring   (User_13/27/42/66/88 sharing Dev_SHARED_1 / 10.99.0.1)
     """
 
     LOCATIONS = ["US", "IN", "UK", "CA", "AU", "DE", "JP"]
 
-    # ~5% of users are designated as suspicious (more varied behaviour)
+    # Retain original suspicious users for graph/ring detection
     SUSPICIOUS_USER_IDS = {f"User_{i}" for i in [13, 27, 42, 66, 88]}
 
     def __init__(self):
-        self.users = [f"User_{i}" for i in range(1, 101)]
+        self.users    = [f"User_{i}" for i in range(1, 101)]
         self.merchants = [f"Merch_{i}" for i in range(1, 21)]
-        self.devices = [f"Dev_{i}" for i in range(1, 51)]
-        self.ips = [f"192.168.1.{i}" for i in range(1, 256)]
+        self.devices  = [f"Dev_{i}" for i in range(1, 51)]
+        self.ips      = [f"192.168.1.{i}" for i in range(1, 256)]
 
-        # Assign each user a UNIQUE device and IP so normal users don't
-        # accidentally form fraud rings.  Only suspicious users share
-        # resources to create genuinely detectable rings.
-        rng = random.Random(42)  # deterministic for reproducibility
+        rng = random.Random(42)
         self._user_profiles: dict[str, dict] = {}
         for idx, user in enumerate(self.users):
             self._user_profiles[user] = {
-                "home_location": rng.choice(self.LOCATIONS),
-                "primary_device": f"Dev_{user}",                   # unique per user
-                "primary_ip": f"10.0.{idx // 256}.{idx % 256}",   # unique per user
+                "home_location":  rng.choice(self.LOCATIONS),
+                "primary_device": f"Dev_{user}",
+                "primary_ip":     f"10.0.{idx // 256}.{idx % 256}",
             }
 
-        # Suspicious users intentionally share a device + IP → real fraud ring
-        shared_device = "Dev_SHARED_1"
-        shared_ip = "10.99.0.1"
+        # Suspicious users share a device + IP → fraud ring detection
         for sus_user in self.SUSPICIOUS_USER_IDS:
-            self._user_profiles[sus_user]["primary_device"] = shared_device
-            self._user_profiles[sus_user]["primary_ip"] = shared_ip
+            self._user_profiles[sus_user]["primary_device"] = "Dev_SHARED_1"
+            self._user_profiles[sus_user]["primary_ip"]     = "10.99.0.1"
 
     def generate(self) -> Transaction:
-        """Generate a single transaction with realistic patterns."""
-        user = random.choice(self.users)
+        """Generate one transaction.
+
+        Probability breakdown:
+            90% → normal user transaction
+             5% → velocity fraud (all four FRAUD_* keys)
+             5% → suspicious ring user (existing ring detection)
+        """
+        roll = random.random()
+
+        if roll < 0.05:
+            return self._generate_velocity_fraud()
+        if roll < 0.10:
+            return self._generate_ring_user()
+        return self._generate_normal()
+
+    # ------------------------------------------------------------------
+
+    def _generate_normal(self) -> Transaction:
+        user    = random.choice(self.users)
         profile = self._user_profiles[user]
-        is_suspicious = user in self.SUSPICIOUS_USER_IDS
 
-        # --- Amount ---
-        if is_suspicious:
-            # Suspicious users: wider range, occasionally very high
-            r = random.random()
-            if r < 0.3:
-                amount = round(random.uniform(5000, 20000), 2)  # high
-            elif r < 0.5:
-                amount = round(random.uniform(1000, 5000), 2)   # medium
-            else:
-                amount = round(random.uniform(10, 500), 2)      # normal
+        r = random.random()
+        if r < 0.02:
+            amount = round(random.uniform(5000, 15000), 2)
+        elif r < 0.10:
+            amount = round(random.uniform(500, 2000), 2)
         else:
-            # Normal users: mostly small, rare medium
-            r = random.random()
-            if r < 0.02:
-                amount = round(random.uniform(5000, 15000), 2)  # rare high
-            elif r < 0.10:
-                amount = round(random.uniform(500, 2000), 2)    # occasional medium
-            else:
-                amount = round(random.uniform(10, 500), 2)      # typical
+            amount = round(random.uniform(10, 500), 2)
 
-        # --- Location ---
-        if is_suspicious:
-            # Suspicious users jump locations ~40% of the time
-            if random.random() < 0.4:
-                location = random.choice([l for l in self.LOCATIONS if l != profile["home_location"]])
-            else:
-                location = profile["home_location"]
-        else:
-            # Normal users stay home ~90% of the time
-            if random.random() < 0.10:
-                location = random.choice([l for l in self.LOCATIONS if l != profile["home_location"]])
-            else:
-                location = profile["home_location"]
+        location = (
+            random.choice([l for l in self.LOCATIONS if l != profile["home_location"]])
+            if random.random() < 0.10 else profile["home_location"]
+        )
 
-        # --- Device ---
-        if is_suspicious and random.random() < 0.3:
-            device_id = random.choice(self.devices)
-        else:
-            device_id = profile["primary_device"]
+        return Transaction(
+            transaction_id=str(uuid.uuid4()),
+            user_id=user,
+            amount=amount,
+            currency="USD",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            merchant_id=random.choice(self.merchants),
+            location=location,
+            device_id=profile["primary_device"],
+            ip_address=profile["primary_ip"],
+        )
 
-        # --- IP ---
-        if is_suspicious and random.random() < 0.3:
-            ip_address = random.choice(self.ips)
+    def _generate_velocity_fraud(self) -> Transaction:
+        """Fraud transaction using all four fixed fraud dimension keys.
+
+        Every call increments the ksqlDB window counter for FRAUD_IP,
+        FRAUD_USER, FRAUD_DEVICE, and FRAUD_MERCHANT simultaneously.
+        """
+        amount = round(random.uniform(500, 8000), 2)
+        return Transaction(
+            transaction_id=str(uuid.uuid4()),
+            user_id=FRAUD_USER,
+            amount=amount,
+            currency="USD",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            merchant_id=FRAUD_MERCHANT,
+            location=random.choice(self.LOCATIONS),
+            device_id=FRAUD_DEVICE,
+            ip_address=FRAUD_IP,
+        )
+
+    def _generate_ring_user(self) -> Transaction:
+        """Suspicious ring user — shares Dev_SHARED_1 / 10.99.0.1."""
+        user    = random.choice(list(self.SUSPICIOUS_USER_IDS))
+        profile = self._user_profiles[user]
+
+        r = random.random()
+        if r < 0.3:
+            amount = round(random.uniform(5000, 20000), 2)
+        elif r < 0.5:
+            amount = round(random.uniform(1000, 5000), 2)
         else:
-            ip_address = profile["primary_ip"]
+            amount = round(random.uniform(10, 500), 2)
+
+        location = (
+            random.choice([l for l in self.LOCATIONS if l != profile["home_location"]])
+            if random.random() < 0.4 else profile["home_location"]
+        )
+        device_id  = random.choice(self.devices) if random.random() < 0.3 else profile["primary_device"]
+        ip_address = random.choice(self.ips)     if random.random() < 0.3 else profile["primary_ip"]
 
         return Transaction(
             transaction_id=str(uuid.uuid4()),

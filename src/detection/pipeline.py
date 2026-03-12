@@ -1,134 +1,128 @@
 import logging
 from datetime import datetime, timezone
 
-from src.models.fraud_result import FraudResult
-from src.models.transaction import Transaction
-from src.detection.rules import Rule
+from src.detection.rules import BlacklistRule, HighWindowAmountRule, Rule, VelocityAlertRule
 from src.detection.ml_model import IsolationForestModel
 from src.fraud_rings.graph_engine import FraudGraph
 
 logger = logging.getLogger(__name__)
 
-# Default thresholds (overridden if config is provided)
-_DEFAULT_FRAUD_THRESHOLD = 0.8
-_DEFAULT_REVIEW_THRESHOLD = 0.3
+# Routing thresholds (0-100 integer scale)
+_DEFAULT_FRAUD_THRESHOLD  = 80
+_DEFAULT_REVIEW_THRESHOLD = 30
+
+
+def _probabilistic_union(rule_results: list[dict]) -> int:
+    """Aggregate severities using probabilistic union: 1 − ∏(1 − pᵢ/100).
+
+    Mirrors production fed_backend.scoring.calculate_bucketed_fraud_score().
+    A single 95-severity rule alone yields score 95.
+    Two 60-severity rules yield 1-(0.4*0.4)=84, escalating to block.
+    """
+    if not rule_results:
+        return 0
+    product = 1.0
+    for r in rule_results:
+        product *= 1.0 - r["severity"] / 100.0
+    return min(round((1.0 - product) * 100), 100)
 
 
 class ScoringPipeline:
-    """Central orchestrator that combines rules, ML, graph analysis, and (optionally) LLM."""
+    """Orchestrates multi-layer fraud scoring for velocity alerts.
+
+    Input:  alert_data dict — {dimension, dimension_key, txn_count,
+                               total_amount, window_start, window_end}
+    Output: scored result dict — same fields plus score, routing,
+                                 triggered_rules, reasons, scored_at
+    """
 
     def __init__(
         self,
-        rules: list[Rule],
-        ml_model: IsolationForestModel,
-        graph_engine: FraudGraph,
-        llm_analyzer=None,
-        ab_router=None,
-        fraud_threshold: float = _DEFAULT_FRAUD_THRESHOLD,
-        review_threshold: float = _DEFAULT_REVIEW_THRESHOLD,
+        ml_model: IsolationForestModel | None = None,
+        graph_engine: FraudGraph | None = None,
+        fraud_threshold: int = _DEFAULT_FRAUD_THRESHOLD,
+        review_threshold: int = _DEFAULT_REVIEW_THRESHOLD,
     ):
-        self._rules = rules
-        self._ml_model = ml_model
+        self._rules: list[Rule] = [VelocityAlertRule(), HighWindowAmountRule()]
+        self._blacklist_rule = BlacklistRule()
+        self._ml_model = ml_model or IsolationForestModel()
         self._graph_engine = graph_engine
-        self._llm_analyzer = llm_analyzer
-        self._ab_router = ab_router
-        self._fraud_threshold = fraud_threshold
+        self._fraud_threshold  = fraud_threshold
         self._review_threshold = review_threshold
-        self._history: dict[str, list[Transaction]] = {}  # user_id -> recent txns
 
-    def score(self, transaction: Transaction) -> FraudResult:
-        """Score a transaction through the full detection pipeline."""
-        user_id = transaction.user_id
-        user_history = self._history.get(user_id, [])
-
-        # --- 1. Rule evaluation ---
-        scores: list[float] = []
+    def score_alert(self, alert_data: dict) -> dict:
+        """Score a pre-aggregated velocity alert through all detection layers."""
+        triggered_rules: list[dict] = []
         reasons: list[str] = []
-        triggered_rule: str | None = None
 
+        # 1. Rule evaluation
         for rule in self._rules:
-            rule_score = rule.evaluate(transaction, user_history)
-            if rule_score > 0:
-                scores.append(rule_score)
-                reasons.append(f"{rule.name}: {rule.description}")
-                if rule_score >= self._fraud_threshold:
-                    triggered_rule = rule.name
+            result = rule.evaluate(alert_data)
+            if result:
+                triggered_rules.append(result)
+                reasons.append(result["reason"])
 
-        # --- 2. ML prediction ---
-        if self._ab_router is not None:
-            # A/B routing: pick the model version the router selects
-            model = self._ab_router.route(transaction)
-            ml_score = model.predict(transaction)
-        else:
-            ml_score = self._ml_model.predict(transaction)
+        # 2. Blacklist
+        bl = self._blacklist_rule.evaluate(alert_data)
+        if bl:
+            triggered_rules.append(bl)
+            reasons.append(bl["reason"])
 
-        if ml_score > 0:
-            scores.append(ml_score)
-            reasons.append("ML Anomaly: Machine learning detected unusual pattern")
-
-        # Add training sample for future retraining
-        self._ml_model.add_training_sample(transaction)
+        # 3. ML anomaly (optional — only active once trained)
+        self._ml_model.add_sample(alert_data)
         if self._ml_model.should_retrain():
             self._ml_model.train()
 
-        # --- 3. Graph analysis ---
-        self._graph_engine.add_transaction(transaction)
-        ring = self._graph_engine.get_ring_for_user(user_id)
-        fraud_ring_id: str | None = None
+        ml_score = self._ml_model.predict(alert_data)
+        if ml_score > 0:
+            severity = min(round(ml_score * 100), 100)
+            triggered_rules.append({
+                "rule_id":   "ml_anomaly",
+                "rule_name": "ML Anomaly",
+                "severity":  severity,
+                "bucket_id": "ml",
+            })
+            reasons.append(f"ML anomaly score: {ml_score:.2f}")
 
-        if ring is not None:
-            scores.append(ring.risk_score)
-            reasons.append(
-                f"Fraud Ring: {len(ring.user_ids)} users share {ring.shared_resource_type} "
-                f"'{ring.shared_resource_id}'"
-            )
-            fraud_ring_id = ring.ring_id
+        # 4. Graph ring detection (optional)
+        if self._graph_engine is not None:
+            dim_key = alert_data.get("dimension_key", "")
+            ring = self._graph_engine.get_ring_for_user(dim_key)
+            if ring is not None:
+                ring_sev = min(round(ring.risk_score * 100), 100)
+                triggered_rules.append({
+                    "rule_id":   "fraud_ring",
+                    "rule_name": "FraudRing",
+                    "severity":  ring_sev,
+                    "bucket_id": "ring",
+                })
+                reasons.append(
+                    f"Fraud ring: {len(ring.user_ids)} members share "
+                    f"{ring.shared_resource_type} '{ring.shared_resource_id}'"
+                )
 
-        # --- 4. Aggregate score ---
-        # Use a blend of max and mean so that a single moderate signal
-        # doesn't immediately reach the fraud threshold, but multiple
-        # moderate signals or one very strong signal still do.
-        if scores:
-            final_score = 0.6 * max(scores) + 0.4 * (sum(scores) / len(scores))
-        else:
-            final_score = 0.0
+        # 5. Probabilistic union aggregation
+        final_score = _probabilistic_union(triggered_rules)
 
-        # --- 5. LLM summary (placeholder for future integration) ---
-        llm_summary: str | None = None
-        if self._llm_analyzer is not None and final_score >= self._review_threshold:
-            try:
-                llm_summary = self._llm_analyzer.analyze(transaction, reasons)
-            except Exception:
-                logger.debug("LLM analysis failed", exc_info=True)
-
-        # --- 6. Determine routing ---
+        # 6. Route
         if final_score >= self._fraud_threshold:
-            routed_to = "fraud-alerts"
+            routing = "block"
         elif final_score >= self._review_threshold:
-            routed_to = "human-review"
+            routing = "review"
         else:
-            routed_to = "approved-transactions"
+            routing = "allow"
 
-        # --- 7. Build result ---
-        # Ensure native Python types (ML model can return numpy scalars)
-        result = FraudResult(
-            transaction_id=transaction.transaction_id,
-            is_fraud=bool(final_score >= self._fraud_threshold),
-            score=round(float(final_score), 4),
-            reasons=reasons,
-            rule_triggered=triggered_rule,
-            model_version=self._ml_model.version,
-            fraud_ring_id=fraud_ring_id,
-            llm_summary=llm_summary,
-            routed_to=routed_to,
-            scored_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        )
-
-        # --- 8. Update history (cap at 100 per user) ---
-        if user_id not in self._history:
-            self._history[user_id] = []
-        self._history[user_id].append(transaction)
-        if len(self._history[user_id]) > 100:
-            self._history[user_id] = self._history[user_id][-100:]
-
-        return result
+        return {
+            "dimension":      alert_data.get("dimension"),
+            "dimension_key":  alert_data.get("dimension_key"),
+            "txn_count":      alert_data.get("txn_count"),
+            "total_amount":   alert_data.get("total_amount"),
+            "window_start":   alert_data.get("window_start"),
+            "window_end":     alert_data.get("window_end"),
+            "score":          final_score,
+            "routing":        routing,
+            "triggered_rules": triggered_rules,
+            "reasons":        reasons,
+            "model_version":  self._ml_model.version,
+            "scored_at":      datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
