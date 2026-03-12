@@ -232,7 +232,3 @@ Kafka UI at `http://localhost:8090`.
 - [ ] Prometheus metrics endpoint + Grafana dashboard
 
 ---
-
-![when the fraud ring detector fires](https://media.giphy.com/media/l0HlQ7LRalQqdWfao/giphy.gif)
-
-*When the graph engine finds a fraud ring at 3am.*
