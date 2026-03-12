@@ -1,24 +1,26 @@
 # MySQL Kafka GNN FED
 
-Real-time fraud detection platform. Transactions stream through Kafka, get scored by three detection layers in sequence, and land in MySQL — all within a single scoring call.
-
-![fraud detector loading up](https://media.giphy.com/media/xT9IgzoKnwFNmISR8I/giphy.gif)
+Real-time fraud detection platform. Kafka streams transactions through ksqlDB velocity aggregation, then a multi-layer scoring pipeline classifies each alert and routes it to block, review, or allow.
 
 ---
 
 ## What this is
 
-A modular fraud detection backend that combines rules, machine learning, and graph analysis to score every transaction as it arrives. Analysts review borderline cases, and their feedback feeds directly back into model retraining. No manual retraining steps.
+The system operates on **pre-aggregated velocity windows** rather than individual transactions. ksqlDB maintains four 1-hour tumbling aggregation tables — one each for IP, user, device, and merchant — and emits alerts when any dimension exceeds its threshold. The scoring pipeline consumes those alerts, not raw transactions.
 
-The three detection layers run in order for each transaction:
+This mirrors how production fraud systems work: flagging entities with abnormal velocity is more reliable than scoring each individual transaction in isolation.
 
-1. **Rules** — fast, deterministic checks: high amount thresholds, rapid location changes, and velocity counting via ksqlDB (5-minute tumbling window)
-2. **Isolation Forest** — unsupervised ML model that flags statistical outliers, auto-retrains when enough analyst feedback accumulates
-3. **Graph engine** — builds a NetworkX graph linking users to shared devices and IPs; flags fraud rings when three or more users share a resource
+The pipeline layers:
 
-Scores from all three layers combine into a final score. Transactions above 0.8 go straight to block. Between 0.3 and 0.8 they go to the analyst review queue. Below 0.3 they pass through.
+1. **VelocityAlertRule** — tiered severity per dimension. IP ≥60 txns/h triggers at severity 60; ≥80 at 80; ≥100 at 95. USER and DEVICE share the same tiers at lower thresholds (30/45/60). MERCHANT thresholds are higher (150/200/300).
+2. **HighWindowAmountRule** — flags windows with total transaction amounts above $10k (severity 50), $20k (70), or $50k (90).
+3. **BlacklistRule** — immediate severity 100 if the dimension key is on the blocklist.
+4. **Isolation Forest** — anomaly score derived from window-level features (txn_count, total_amount, window duration, amount per txn). Auto-retrains when enough feedback accumulates.
+5. **FraudGraph** — NetworkX graph linking users to shared devices and IPs. Three or more users sharing a resource form a fraud ring.
 
-An optional Azure OpenAI layer can explain borderline decisions in plain text, but the system runs fine without it.
+Scores from all layers aggregate via **probabilistic union** (1 − ∏(1 − sᵢ/100)), matching the production FED scoring formula. Final score is on a 0–100 integer scale. Above 80 → block. 30–80 → analyst review. Below 30 → allow.
+
+Analyst verdicts feed back into automatic ML retraining. No manual steps.
 
 ---
 
@@ -41,40 +43,102 @@ An optional Azure OpenAI layer can explain borderline decisions in plain text, b
 ## Architecture
 
 ```
-Simulated producer
-      |
-      v
- Kafka topic: transactions
-      |
-      +---> ksqlDB: user_velocity (5-min tumbling window)
-      |
-      v
- FraudConsumer
-      |
-      v
- ScoringPipeline
-      |
-      +--- HighAmountRule      (graduated: $2k=0.35, $5k=0.6, $10k=0.9)
-      +--- LocationAnomalyRule (rapid location changes across recent history)
-      +--- VelocityRule        (queries ksqlDB live per transaction)
-      +--- IsolationForest     (ML anomaly score, auto-retrained on feedback)
-      +--- FraudGraph          (NetworkX: users sharing device or IP)
-      +--- LLMAnalyzer         (optional Azure OpenAI explanation)
-      |
-      v
-  Final score
-      |
-      +--- > 0.8  --> Block (Kafka: fraud_alerts topic)
-      +--- 0.3-0.8 -> Review queue (analyst inbox)
-      +--- < 0.3  --> Allow
-      |
-      v
-   MySQL: transactions, fraud_results, fraud_rings
-      |
-      v
-   Analyst review --> feedback_store --> RetrainTrigger
-      (100 feedback entries triggers a new IsolationForest fit)
+seed.py / SimulatedProducer
+         |
+         v
+  Kafka topic: transactions
+         |
+         v
+  ksqlDB 1h tumbling windows (4 dimensions)
+         |
+    +----+----+----+
+    |    |    |    |
+   IP  USER DEV MERCH    (FED_velocity_table_*_1h)
+    |    |    |    |
+  alert stream per dimension
+  (threshold filters)
+    |    |    |    |
+    +----+----+----+
+         |
+         v
+  FED_velocity_stream_alerts_all
+  (fan-in via INSERT INTO)
+         |
+         v
+  FraudConsumer
+  (normalises ksqlDB UPPERCASE keys to lowercase)
+         |
+         v
+  ScoringPipeline.score_alert()
+         |
+    +----+----+----+----+----+
+    |                        |
+  VelocityAlertRule        BlacklistRule
+  HighWindowAmountRule     IsolationForest
+                           FraudGraph
+    |
+    v
+  probabilistic union  →  score 0-100
+         |
+    +---------+---------+
+    |         |         |
+  >=80      30-80      <30
+  block    review     allow
+    |         |
+    v         v
+  MySQL: fraud_results
+         |
+         v
+  Analyst review → FeedbackStore → RetrainTrigger
+  (fires at 100 labeled entries → new IsolationForest version)
 ```
+
+---
+
+## ksqlDB Velocity Windows
+
+Four 1-hour tumbling aggregation tables run continuously:
+
+| Table | Dimension | Alert thresholds (txn_count → severity) |
+|---|---|---|
+| `FED_velocity_table_ip_1h` | IP address | ≥60→60, ≥80→80, ≥100→95 |
+| `FED_velocity_table_user_1h` | User ID | ≥30→60, ≥45→80, ≥60→95 |
+| `FED_velocity_table_device_1h` | Device ID | ≥30→60, ≥45→80, ≥60→95 |
+| `FED_velocity_table_merchant_1h` | Merchant ID | ≥150→60, ≥200→80, ≥300→95 |
+
+Each table feeds a per-dimension alert stream. All four alert streams fan into `FED_velocity_stream_alerts_all` via `INSERT INTO` (ksqlDB's `UNION ALL` workaround). The `FraudConsumer` subscribes to this unified topic.
+
+---
+
+## Detection Rules
+
+**VelocityAlertRule** — reads `dimension` and `txn_count` from the alert.
+
+| Dimension | txn_count | Severity |
+|---|---|---|
+| IP | ≥ 100 | 95 |
+| IP | ≥ 80 | 80 |
+| IP | ≥ 60 | 60 |
+| USER / DEVICE | ≥ 60 | 95 |
+| USER / DEVICE | ≥ 45 | 80 |
+| USER / DEVICE | ≥ 30 | 60 |
+| MERCHANT | ≥ 300 | 95 |
+| MERCHANT | ≥ 200 | 80 |
+| MERCHANT | ≥ 150 | 60 |
+
+**HighWindowAmountRule** — reads `total_amount` from the window.
+
+| total_amount | Severity |
+|---|---|
+| ≥ $50,000 | 90 |
+| ≥ $20,000 | 70 |
+| ≥ $10,000 | 50 |
+
+**BlacklistRule** — checks `dimension_key` against an in-memory set. Severity 100 on match. Add entries via `BlacklistRule.add("10.99.0.99")`.
+
+**Score aggregation** — probabilistic union: `score = round((1 − ∏(1 − sᵢ/100)) × 100)`.
+
+Two rules at severity 60 each → score 84. One rule at 95 → score 95.
 
 ---
 
@@ -85,7 +149,7 @@ Simulated producer
 | MySQL | 3306 | Transaction storage, feedback, experiments, model versions |
 | Zookeeper | 2181 | Kafka coordination |
 | Kafka | 9092 | Event backbone |
-| ksqlDB | 8088 | Streaming SQL — velocity aggregation |
+| ksqlDB | 8088 | Streaming SQL — 4-dimension velocity aggregation |
 | Kafka UI | 8090 | Cluster monitoring |
 | Fraud Engine | 8000 | FastAPI + all detection components |
 
@@ -96,13 +160,13 @@ Simulated producer
 | Route | Purpose |
 |---|---|
 | `GET /health` | Service health |
-| `POST /transactions/score` | Score a single transaction |
-| `GET /transactions/{id}` | Get transaction + fraud result |
+| `POST /transactions/score` | Score a single transaction (single-transaction estimate) |
+| `GET /transactions/{id}` | Get stored transaction and fraud result |
 | `GET /review/queue` | Pending analyst review items |
 | `POST /review/{id}/feedback` | Submit analyst verdict |
 | `GET /experiments` | List A/B experiments |
 | `POST /experiments` | Create new experiment |
-| `GET /metrics/summary` | Block/challenge/allow rates, queue depth |
+| `GET /metrics/summary` | Block/review/allow rates, queue depth |
 | `GET /` | Live monitoring dashboard |
 
 ---
@@ -112,67 +176,42 @@ Simulated producer
 Seven tables in MySQL:
 
 - `transactions` — raw transaction records
-- `fraud_results` — score, reasons, model version, LLM summary, routing decision
+- `fraud_results` — score (0-100), triggered rules, routing decision, model version
 - `analyst_feedback` — true/false positives/negatives with analyst notes
 - `ab_experiments` — control vs challenger model, traffic split, status
-- `ab_metrics` — per-transaction score, latency, correctness for each experiment arm
+- `ab_metrics` — per-alert score, latency, correctness per experiment arm
 - `model_versions` — training history, contamination param, active flag
 - `fraud_rings` — detected rings with shared resource, user list, risk score, total amount
 
 ---
 
-## Detection Rules
-
-**HighAmountRule**
-
-| Amount | Score |
-|---|---|
-| > $10,000 | 0.90 |
-| > $5,000 | 0.60 |
-| > $2,000 | 0.35 |
-
-**LocationAnomalyRule** — Checks last 5 transactions per user. One location change scores 0.5. Three or more distinct locations in the window scores 0.7.
-
-**VelocityRule** — Live ksqlDB query against a 5-minute tumbling window.
-
-| txn_count | Score |
-|---|---|
-| 8 - 14 | 0.40 |
-| 15 - 24 | 0.60 |
-| 25+ | 0.85 |
-
-**FraudGraph** — A user sharing a device or IP with 3+ other users forms a fraud ring. Risk score scales with ring size: `min(user_count / 10, 1.0)`.
-
----
-
 ## Feedback Loop and Retraining
 
-Analysts review transactions in the queue and submit one of three verdicts: `true_positive`, `false_positive`, `false_negative`.
-
 ```
-Analyst verdict
+Analyst verdict (true_positive / false_positive / false_negative)
       |
       v
- feedback_store (Kafka + MySQL)
+ FeedbackStore (Kafka + MySQL)
       |
       v
  RetrainTrigger
  (polls every 5 minutes, fires when feedback_count >= 100)
       |
       v
- IsolationForest.fit() on labeled data
+ IsolationForest.fit() on window-level alert features
+ (txn_count, total_amount, duration_min, amount_per_txn)
       |
       v
- new model_version row in MySQL, set is_active = TRUE
+ new model_version in MySQL, set is_active = TRUE
 ```
 
-The system keeps running during retraining. The old model continues scoring until the new version is live.
+The old model continues scoring until the new version is live.
 
 ---
 
 ## A/B Testing
 
-Create an experiment with a control model version and a challenger. Set a traffic split (max 50%). The `ABRouter` assigns each incoming transaction to an arm and logs score, latency, and correctness to `ab_metrics`. Compare results through the `/experiments` and `/metrics` routes.
+Create an experiment with a control and challenger model version. Set a traffic split (max 50%). `ABRouter` assigns each alert to an arm deterministically by hashing `dimension_key`. Scores, latency, and correctness are logged to `ab_metrics`.
 
 ---
 
@@ -183,16 +222,27 @@ git clone https://github.com/langk1026/MySQL_Kafka_GNN_FED.git
 cd MySQL_Kafka_GNN_FED
 
 cp .env.example .env
-# Fill in MYSQL_PASSWORD, MYSQL_ROOT_PASSWORD
+# Set MYSQL_PASSWORD, MYSQL_ROOT_PASSWORD
 # Optional: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY
 
 docker compose up -d --build
 docker compose logs -f fraud-engine
 ```
 
-Dashboard available at `http://localhost:8000` once the fraud-engine service is healthy.
+Dashboard at `http://localhost:8000`. Kafka UI at `http://localhost:8090`.
 
-Kafka UI at `http://localhost:8090`.
+### Testing velocity alerts without Docker
+
+```bash
+# Preview transactions without producing
+python seed.py --dry-run
+
+# Produce continuously (triggers USER/DEVICE alerts in ~3 min)
+python seed.py
+
+# Faster — all 4 dimension alerts within ~5 min
+python seed.py --rate 20 --interval 3
+```
 
 ---
 
@@ -207,8 +257,8 @@ Kafka UI at `http://localhost:8090`.
 | `AZURE_OPENAI_API_KEY` | — | No |
 | `AZURE_OPENAI_DEPLOYMENT` | `gpt-4o` | No |
 | `LLM_ENABLED` | `true` | No |
-| `SCORE_THRESHOLD_FRAUD` | `0.8` | No |
-| `SCORE_THRESHOLD_REVIEW` | `0.3` | No |
+| `SCORE_THRESHOLD_FRAUD` | `80` | No |
+| `SCORE_THRESHOLD_REVIEW` | `30` | No |
 | `RETRAIN_FEEDBACK_THRESHOLD` | `100` | No |
 | `FRAUD_RING_MIN_USERS` | `3` | No |
 
@@ -217,18 +267,18 @@ Kafka UI at `http://localhost:8090`.
 ## Known Limitations
 
 - Single Kafka broker — not suitable for production without replication factor > 1
-- IsolationForest runs in-process; a high-throughput deployment would want this as a separate service
-- FraudGraph is in-memory and resets on restart — production would need a persistent graph store (e.g. Neo4j)
-- LLM scoring adds 1-3 seconds per flagged transaction depending on Azure OpenAI latency
+- IsolationForest runs in-process; high throughput would need it as a separate service
+- FraudGraph is in-memory and resets on restart — production would need a persistent graph store (Neo4j or similar)
+- `POST /transactions/score` builds a synthetic single-transaction alert. Real scoring uses the ksqlDB velocity pipeline.
+- BlacklistRule uses an in-memory set — entries are lost on restart without a backing store
 
 ---
 
 ## Roadmap
 
 - [ ] Persist FraudGraph to Neo4j
-- [ ] Replace IsolationForest with an online learning model (e.g. River)
+- [ ] Replace IsolationForest with an online learning model (River)
 - [ ] Add GNN layer using PyTorch Geometric on the fraud ring graph
 - [ ] Kafka Schema Registry + Avro serialization
 - [ ] Prometheus metrics endpoint + Grafana dashboard
-
----
+- [ ] Persistent blacklist backed by Redis or MySQL
